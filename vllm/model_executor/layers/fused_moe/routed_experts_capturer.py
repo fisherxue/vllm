@@ -815,6 +815,17 @@ def bind_routing_capture_to_model(model) -> None:
                     f"dp_size={module.moe_config.dp_size})."
                 )
 
+            if module.quant_method.is_monolithic:
+                raise NotImplementedError(
+                    "routed-experts capture requires the non-monolithic "
+                    "(Triton) MoE path so that select_experts() runs in "
+                    "Python and logical expert IDs can be captured. "
+                    f"Layer {module.moe_layer_id} uses monolithic quant "
+                    f"method {type(module.quant_method).__name__}. "
+                    "Disable FlashInfer MoE or set "
+                    "enable_return_routed_experts=False."
+                )
+
             layer_id = module.moe_layer_id
             layer_buf = buffer[layer_id]  # (N_max, K)
             module._routing_replay_out = layer_buf
@@ -831,15 +842,7 @@ def bind_routing_capture_to_model(model) -> None:
             # buffer receives logical IDs. The runner's post-
             # select_experts() write is guarded to avoid overwriting
             # with physical IDs when capture_fn is set.
-            #
-            # Monolithic kernels (e.g. FlashInfer) write to
-            # _routing_replay_out directly from within the kernel, so
-            # we still bind the buffer above.  But select_experts() is
-            # never called for them, so capture_fn would never fire —
-            # don't set it.  Those layers will capture physical IDs.
-            if not module.quant_method.is_monolithic and hasattr(
-                module, "router"
-            ):
+            if hasattr(module, "router"):
                 _buf = layer_buf
 
                 def _capture_logical_ids(

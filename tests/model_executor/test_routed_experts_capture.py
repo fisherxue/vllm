@@ -239,14 +239,18 @@ def test_capture_fn_writes_logical_ids_to_buffer(monkeypatch):
     assert torch.equal(buffer[0, :2, :], expected)
 
 
-def test_monolithic_layers_get_buffer_but_no_capture_fn(monkeypatch):
-    """Monolithic layers get _routing_replay_out (kernel writes directly) but no capture_fn."""
+def test_monolithic_layers_raise_error(monkeypatch):
+    """Monolithic quant methods should raise NotImplementedError."""
     import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
     import vllm.model_executor.layers.fused_moe.routed_experts_capturer as rec_mod
 
     class _DummyMoEConfig:
         is_sequence_parallel = False
         dp_size = 1
+
+    class _MonolithicQuantMethod:
+        supports_internal_mk = True
+        is_monolithic = True
 
     class _DummyRouter:
         def __init__(self):
@@ -255,22 +259,11 @@ def test_monolithic_layers_get_buffer_but_no_capture_fn(monkeypatch):
         def set_capture_fn(self, fn):
             self.capture_fn = fn
 
-    class _MonolithicQuantMethod:
-        supports_internal_mk = True
-        is_monolithic = True
-
-    class _NonMonolithicQuantMethod:
-        supports_internal_mk = True
-        is_monolithic = False
-
     class DummyFusedMoE:
-        def __init__(self, moe_layer_id, monolithic=False):
+        def __init__(self, moe_layer_id):
             self.moe_layer_id = moe_layer_id
             self.moe_config = _DummyMoEConfig()
-            self.quant_method = (
-                _MonolithicQuantMethod() if monolithic
-                else _NonMonolithicQuantMethod()
-            )
+            self.quant_method = _MonolithicQuantMethod()
             self.router = _DummyRouter()
 
     monkeypatch.setattr(fused_moe_layer, "FusedMoE", DummyFusedMoE)
@@ -288,21 +281,11 @@ def test_monolithic_layers_get_buffer_but_no_capture_fn(monkeypatch):
 
     monkeypatch.setattr(rec_mod, "get_global_experts_capturer", lambda: DummyCapturer())
 
-    m_mono = DummyFusedMoE(moe_layer_id=0, monolithic=True)
-    m_normal = DummyFusedMoE(moe_layer_id=1, monolithic=False)
+    m_mono = DummyFusedMoE(moe_layer_id=0)
 
     class DummyModel:
         def modules(self):
-            return iter([m_mono, m_normal])
+            return iter([m_mono])
 
-    rec_mod.bind_routing_capture_to_model(DummyModel())
-
-    # Monolithic layer: buffer bound (kernel writes directly), no capture_fn
-    assert hasattr(m_mono, "_routing_replay_out")
-    assert torch.equal(m_mono._routing_replay_out, buffer[0])
-    assert m_mono.router.capture_fn is None
-
-    # Normal layer: buffer and capture_fn set
-    assert hasattr(m_normal, "_routing_replay_out")
-    assert torch.equal(m_normal._routing_replay_out, buffer[1])
-    assert m_normal.router.capture_fn is not None
+    with pytest.raises(NotImplementedError, match="monolithic"):
+        rec_mod.bind_routing_capture_to_model(DummyModel())
