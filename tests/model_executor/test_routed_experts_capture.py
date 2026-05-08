@@ -239,8 +239,8 @@ def test_capture_fn_writes_logical_ids_to_buffer(monkeypatch):
     assert torch.equal(buffer[0, :2, :], expected)
 
 
-def test_monolithic_layers_are_skipped(monkeypatch):
-    """Monolithic quant methods should not get capture_fn or _routing_replay_out."""
+def test_monolithic_layers_get_buffer_but_no_capture_fn(monkeypatch):
+    """Monolithic layers get _routing_replay_out (kernel writes directly) but no capture_fn."""
     import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
     import vllm.model_executor.layers.fused_moe.routed_experts_capturer as rec_mod
 
@@ -297,10 +297,12 @@ def test_monolithic_layers_are_skipped(monkeypatch):
 
     rec_mod.bind_routing_capture_to_model(DummyModel())
 
-    # Monolithic layer: no buffer, no capture_fn
-    assert not hasattr(m_mono, "_routing_replay_out")
+    # Monolithic layer: buffer bound (kernel writes directly), no capture_fn
+    assert hasattr(m_mono, "_routing_replay_out")
+    assert torch.equal(m_mono._routing_replay_out, buffer[0])
     assert m_mono.router.capture_fn is None
 
     # Normal layer: buffer and capture_fn set
     assert hasattr(m_normal, "_routing_replay_out")
+    assert torch.equal(m_normal._routing_replay_out, buffer[1])
     assert m_normal.router.capture_fn is not None
