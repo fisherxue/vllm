@@ -815,6 +815,16 @@ def bind_routing_capture_to_model(model) -> None:
                     f"dp_size={module.moe_config.dp_size})."
                 )
 
+            if module.quant_method.is_monolithic:
+                logger.warning(
+                    "Skipping routing capture for monolithic FusedMoE "
+                    "layer %s (quant_method=%s). select_experts() is "
+                    "never called; captured data would be stale.",
+                    module.moe_layer_id,
+                    type(module.quant_method).__name__,
+                )
+                continue
+
             layer_id = module.moe_layer_id
             layer_buf = buffer[layer_id]  # (N_max, K)
             module._routing_replay_out = layer_buf
@@ -824,6 +834,23 @@ def bind_routing_capture_to_model(model) -> None:
                 torch.compiler.cudagraph_mark_tensor_static(layer_buf)
             with contextlib.suppress(Exception):
                 torch._dynamo.mark_static_address(layer_buf)
+
+            # Wire capture_fn to write logical (pre-EPLB) expert IDs
+            # into the device buffer. capture_fn fires inside
+            # select_experts() before _apply_eplb_mapping(), so the
+            # buffer receives logical IDs. The runner's post-
+            # select_experts() write is guarded to avoid overwriting
+            # with physical IDs when capture_fn is set.
+            if hasattr(module, "router"):
+                _buf = layer_buf
+
+                def _capture_logical_ids(
+                    topk_ids: torch.Tensor, buf: torch.Tensor = _buf
+                ) -> None:
+                    buf[: topk_ids.shape[0]].copy_(topk_ids.to(buf.dtype))
+
+                module.router.set_capture_fn(_capture_logical_ids)
+
             bound += 1
 
     logger.info(

@@ -530,7 +530,14 @@ class MoERunner(MoERunnerInterface):
             )
 
             # Write routing data for non-monolithic path (Triton, etc.)
-            if routing_replay_out is not None:
+            # Skip when capture_fn is set: the router already wrote
+            # logical (pre-EPLB) IDs to the buffer inside
+            # select_experts(). Writing here would overwrite with
+            # physical (post-EPLB) IDs.
+            if (
+                routing_replay_out is not None
+                and getattr(self.router, "capture_fn", None) is None
+            ):
                 routing_replay_out[: topk_ids.shape[0]].copy_(topk_ids.to(torch.int16))
 
             # Passing shared_experts_input in case SharedExpertsOrder is

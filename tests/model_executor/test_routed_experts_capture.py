@@ -17,6 +17,14 @@ def test_bind_routing_capture_to_model_sets_layer_view(monkeypatch):
 
     class _DummyQuantMethod:
         supports_internal_mk = True
+        is_monolithic = False
+
+    class _DummyRouter:
+        def __init__(self):
+            self.capture_fn = None
+
+        def set_capture_fn(self, fn):
+            self.capture_fn = fn
 
     class DummyFusedMoE:
         _routing_replay_out: torch.Tensor
@@ -25,6 +33,7 @@ def test_bind_routing_capture_to_model_sets_layer_view(monkeypatch):
             self.moe_layer_id = moe_layer_id
             self.moe_config = _DummyMoEConfig()
             self.quant_method = _DummyQuantMethod()
+            self.router = _DummyRouter()
 
     monkeypatch.setattr(fused_moe_layer, "FusedMoE", DummyFusedMoE)
 
@@ -52,6 +61,10 @@ def test_bind_routing_capture_to_model_sets_layer_view(monkeypatch):
 
     assert torch.equal(m0._routing_replay_out, buffer[0])
     assert torch.equal(m2._routing_replay_out, buffer[2])
+
+    # capture_fn should be wired to write logical IDs to the buffer
+    assert m0.router.capture_fn is not None
+    assert m2.router.capture_fn is not None
 
 
 def test_bind_routing_capture_to_model_noop_when_disabled(monkeypatch):
@@ -160,3 +173,134 @@ class TestRoutedExpertsHostCache:
         cache.get_or_grow_buffer("req1", max_pos=50)
         cache.free_request("req1")
         assert cache.get_buffer("req1") is None
+
+
+# =========================================================================
+# Tests for logical-ID capture via capture_fn
+# =========================================================================
+
+
+def test_capture_fn_writes_logical_ids_to_buffer(monkeypatch):
+    """capture_fn should write topk_ids into the device buffer."""
+    import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
+    import vllm.model_executor.layers.fused_moe.routed_experts_capturer as rec_mod
+
+    class _DummyMoEConfig:
+        is_sequence_parallel = False
+        dp_size = 1
+
+    class _DummyQuantMethod:
+        supports_internal_mk = True
+        is_monolithic = False
+
+    class _DummyRouter:
+        def __init__(self):
+            self.capture_fn = None
+
+        def set_capture_fn(self, fn):
+            self.capture_fn = fn
+
+    class DummyFusedMoE:
+        def __init__(self, moe_layer_id):
+            self.moe_layer_id = moe_layer_id
+            self.moe_config = _DummyMoEConfig()
+            self.quant_method = _DummyQuantMethod()
+            self.router = _DummyRouter()
+
+    monkeypatch.setattr(fused_moe_layer, "FusedMoE", DummyFusedMoE)
+
+    num_layers, num_tokens, top_k = 4, 8, 2
+    buffer = torch.zeros((num_layers, num_tokens, top_k), dtype=torch.int16)
+
+    class DummyDeviceCache:
+        def __init__(self, buf):
+            self.buffer = buf
+
+    class DummyCapturer:
+        def get_device_cache(self):
+            return DummyDeviceCache(buffer)
+
+    monkeypatch.setattr(rec_mod, "get_global_experts_capturer", lambda: DummyCapturer())
+
+    m0 = DummyFusedMoE(moe_layer_id=0)
+
+    class DummyModel:
+        def modules(self):
+            return iter([m0])
+
+    rec_mod.bind_routing_capture_to_model(DummyModel())
+
+    # Simulate calling capture_fn with logical IDs
+    logical_ids = torch.tensor([[3, 5], [1, 7]], dtype=torch.int32)
+    m0.router.capture_fn(logical_ids)
+
+    # Buffer should contain the logical IDs
+    expected = torch.tensor([[3, 5], [1, 7]], dtype=torch.int16)
+    assert torch.equal(buffer[0, :2, :], expected)
+
+
+def test_monolithic_layers_are_skipped(monkeypatch):
+    """Monolithic quant methods should not get capture_fn or _routing_replay_out."""
+    import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
+    import vllm.model_executor.layers.fused_moe.routed_experts_capturer as rec_mod
+
+    class _DummyMoEConfig:
+        is_sequence_parallel = False
+        dp_size = 1
+
+    class _DummyRouter:
+        def __init__(self):
+            self.capture_fn = None
+
+        def set_capture_fn(self, fn):
+            self.capture_fn = fn
+
+    class _MonolithicQuantMethod:
+        supports_internal_mk = True
+        is_monolithic = True
+
+    class _NonMonolithicQuantMethod:
+        supports_internal_mk = True
+        is_monolithic = False
+
+    class DummyFusedMoE:
+        def __init__(self, moe_layer_id, monolithic=False):
+            self.moe_layer_id = moe_layer_id
+            self.moe_config = _DummyMoEConfig()
+            self.quant_method = (
+                _MonolithicQuantMethod() if monolithic
+                else _NonMonolithicQuantMethod()
+            )
+            self.router = _DummyRouter()
+
+    monkeypatch.setattr(fused_moe_layer, "FusedMoE", DummyFusedMoE)
+
+    num_layers, num_tokens, top_k = 4, 8, 2
+    buffer = torch.zeros((num_layers, num_tokens, top_k), dtype=torch.int16)
+
+    class DummyDeviceCache:
+        def __init__(self, buf):
+            self.buffer = buf
+
+    class DummyCapturer:
+        def get_device_cache(self):
+            return DummyDeviceCache(buffer)
+
+    monkeypatch.setattr(rec_mod, "get_global_experts_capturer", lambda: DummyCapturer())
+
+    m_mono = DummyFusedMoE(moe_layer_id=0, monolithic=True)
+    m_normal = DummyFusedMoE(moe_layer_id=1, monolithic=False)
+
+    class DummyModel:
+        def modules(self):
+            return iter([m_mono, m_normal])
+
+    rec_mod.bind_routing_capture_to_model(DummyModel())
+
+    # Monolithic layer: no buffer, no capture_fn
+    assert not hasattr(m_mono, "_routing_replay_out")
+    assert m_mono.router.capture_fn is None
+
+    # Normal layer: buffer and capture_fn set
+    assert hasattr(m_normal, "_routing_replay_out")
+    assert m_normal.router.capture_fn is not None
