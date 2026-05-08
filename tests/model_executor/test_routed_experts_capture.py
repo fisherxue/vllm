@@ -388,6 +388,165 @@ class TestRoutedExpertsDiskCache:
         assert "passwd" not in path
 
 
+    def test_finalize_chunked_copy_does_not_load_full_tensor(self, tmp_path):
+        """Finalize uses chunked mmap-to-mmap copy, not np.array()."""
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsDiskCache,
+        )
+
+        cache = _RoutedExpertsDiskCache(
+            output_dir=str(tmp_path),
+            num_hidden_layers=2,
+            num_experts=4,
+            max_model_len=1024,
+        )
+        # Write at positions 0-9 and 500-509
+        chunk = np.arange(10 * 2 * 4, dtype=np.float16).reshape(10, 2, 4)
+        cache.write_chunk("req1", np.arange(10), chunk)
+        chunk2 = np.ones((10, 2, 4), dtype=np.float16) * 99.0
+        cache.write_chunk("req1", np.arange(500, 510), chunk2)
+
+        path = cache.finalize("req1")
+        assert path is not None
+        data = np.load(path)
+        # Filled to position 510
+        assert data.shape == (510, 2, 4)
+        assert np.allclose(data[0:10], chunk)
+        assert np.allclose(data[500:510], 99.0)
+        # Positions 10-499 should be zero (unfilled)
+        assert np.allclose(data[10:500], 0.0)
+
+    def test_pid_prefix_in_filenames(self, tmp_path):
+        """Filenames include PID to avoid collisions across restarts."""
+        import os
+
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsDiskCache,
+        )
+
+        cache = _RoutedExpertsDiskCache(
+            output_dir=str(tmp_path),
+            num_hidden_layers=1,
+            num_experts=2,
+            max_model_len=4,
+        )
+        chunk = np.ones((1, 1, 2), dtype=np.float16)
+        cache.write_chunk("req1", np.array([0]), chunk)
+        path = cache.finalize("req1")
+        assert path is not None
+        assert str(os.getpid()) in os.path.basename(path)
+
+
+# =========================================================================
+# Tests for extract_routed_experts_for_current_batch return type
+# =========================================================================
+
+
+def test_extract_returns_tuple_when_capturer_disabled(monkeypatch):
+    """extract_routed_experts_for_current_batch returns (None, None)
+    when capture is disabled, not bare None."""
+    import vllm.model_executor.layers.fused_moe.routed_experts_capturer as rec_mod
+
+    class NoopCapturer:
+        def get_host_cache(self):
+            return None
+
+        def get_device_cache(self):
+            return None
+
+    monkeypatch.setattr(rec_mod, "get_global_experts_capturer", lambda: NoopCapturer())
+
+    result = rec_mod.extract_routed_experts_for_current_batch(
+        req_ids=["r1"],
+        requests={},
+        req_id_to_index={},
+        num_tokens_no_spec=np.array([0]),
+        max_model_len=1024,
+    )
+    # Must be a tuple, not bare None — caller unpacks as (ids, paths)
+    assert isinstance(result, tuple)
+    assert result == (None, None)
+
+
+def test_extract_returns_tuple_when_capturer_is_none(monkeypatch):
+    """extract returns (None, None) when global capturer is None."""
+    import vllm.model_executor.layers.fused_moe.routed_experts_capturer as rec_mod
+
+    monkeypatch.setattr(rec_mod, "get_global_experts_capturer", lambda: None)
+
+    result = rec_mod.extract_routed_experts_for_current_batch(
+        req_ids=[],
+        requests={},
+        req_id_to_index={},
+        num_tokens_no_spec=np.array([]),
+        max_model_len=1024,
+    )
+    assert isinstance(result, tuple)
+    assert result == (None, None)
+
+
+# =========================================================================
+# Tests for RequestOutput.add propagation
+# =========================================================================
+
+
+def test_request_output_add_propagates_router_logits_path():
+    """RequestOutput.add() should merge router_logits_path from next output."""
+    from vllm.outputs import CompletionOutput, RequestOutput
+
+    base = RequestOutput(
+        request_id="r1",
+        prompt="hello",
+        prompt_token_ids=[1, 2],
+        prompt_logprobs=None,
+        outputs=[CompletionOutput(index=0, text="a", token_ids=[3],
+                                  cumulative_logprob=None, logprobs=None)],
+        finished=False,
+    )
+    assert base.router_logits_path is None
+
+    next_out = RequestOutput(
+        request_id="r1",
+        prompt="hello",
+        prompt_token_ids=[1, 2],
+        prompt_logprobs=None,
+        outputs=[CompletionOutput(index=0, text="b", token_ids=[4],
+                                  cumulative_logprob=None, logprobs=None)],
+        finished=True,
+        router_logits_path="/tmp/logits.npy",
+    )
+    base.add(next_out, aggregate=True)
+    assert base.router_logits_path == "/tmp/logits.npy"
+
+
+def test_request_output_add_does_not_overwrite_with_none():
+    """If next output has no path, existing path should be preserved."""
+    from vllm.outputs import CompletionOutput, RequestOutput
+
+    base = RequestOutput(
+        request_id="r1",
+        prompt="hello",
+        prompt_token_ids=[1, 2],
+        prompt_logprobs=None,
+        outputs=[CompletionOutput(index=0, text="a", token_ids=[3],
+                                  cumulative_logprob=None, logprobs=None)],
+        finished=False,
+        router_logits_path="/tmp/existing.npy",
+    )
+
+    next_out = RequestOutput(
+        request_id="r1",
+        prompt="hello",
+        prompt_token_ids=[1, 2],
+        prompt_logprobs=None,
+        outputs=[CompletionOutput(index=0, text="b", token_ids=[4],
+                                  cumulative_logprob=None, logprobs=None)],
+        finished=True,
+    )
+    base.add(next_out, aggregate=True)
+    assert base.router_logits_path == "/tmp/existing.npy"
+
+
 # =========================================================================
 # Integration test: EPLB logical vs physical ID capture (requires GPU)
 # =========================================================================
