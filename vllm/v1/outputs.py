@@ -201,6 +201,9 @@ class ModelRunnerOutput:
     # req_id -> routed experts ndarray of shape (seq_len, num_moe_layers, top_k)
     routed_experts_dict: dict[str, np.ndarray] | None = None
 
+    # req_id -> path to .npy file of shape (seq_len, num_moe_layers, num_experts)
+    router_logits_paths: dict[str, str] | None = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

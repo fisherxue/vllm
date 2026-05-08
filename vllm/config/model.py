@@ -219,6 +219,11 @@ class ModelConfig:
     flexibility."""
     enable_return_routed_experts: bool = False
     """Whether to return routed experts."""
+    enable_return_router_logits: bool = False
+    """Whether to capture full router logits to disk (research feature)."""
+    router_logits_output_dir: str | None = None
+    """Directory for router logits .npy files. Required when
+    enable_return_router_logits is True."""
     max_logprobs: int = 20
     """Maximum number of log probabilities to return when `logprobs` is
     specified in `SamplingParams`. The default value comes the default for the

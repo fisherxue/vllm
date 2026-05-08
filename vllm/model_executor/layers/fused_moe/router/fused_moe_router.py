@@ -21,6 +21,13 @@ class FusedMoERouter(ABC):
     ) -> None:
         raise NotImplementedError
 
+    @abstractmethod
+    def set_logits_capture_fn(
+        self,
+        logits_capture_fn: Callable[[torch.Tensor], None] | None,
+    ) -> None:
+        raise NotImplementedError
+
     @property
     @abstractmethod
     def routing_method_type(self) -> RoutingMethodType:
