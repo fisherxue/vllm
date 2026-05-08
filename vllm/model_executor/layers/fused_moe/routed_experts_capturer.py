@@ -214,11 +214,13 @@ class _RoutedExpertsDiskCache:
         self._req_mmaps: dict[str, np.memmap] = {}
         self._filled_len: dict[str, int] = {}
         self._file_counter = 0
+        self._pid = os.getpid()
 
     def _make_temp_path(self) -> str:
         self._file_counter += 1
         return os.path.join(
-            self.output_dir, f"_tmp_{self._file_counter:08d}.logits.mmap"
+            self.output_dir,
+            f"_tmp_{self._pid}_{self._file_counter:08d}.logits.mmap",
         )
 
     def get_or_create_mmap(self, req_id: str) -> np.memmap:
@@ -242,17 +244,27 @@ class _RoutedExpertsDiskCache:
         max_pos = int(positions.max()) + 1
         self._filled_len[req_id] = max(self._filled_len.get(req_id, 0), max_pos)
 
+    _COPY_CHUNK = 4096
+
     def finalize(self, req_id: str) -> str | None:
-        """Write compact final .npy and delete temp file."""
+        """Write compact final .npy via chunked mmap-to-mmap copy."""
         if req_id not in self._req_mmaps:
             return None
-        mmap = self._req_mmaps.pop(req_id)
+        src = self._req_mmaps.pop(req_id)
         filled = self._filled_len.pop(req_id, 0)
         temp_path = self._req_files.pop(req_id)
-        data = np.array(mmap[:filled])
-        del mmap
         final_path = temp_path.replace("_tmp_", "").replace(".mmap", ".npy")
-        np.save(final_path, data)
+        dst = np.lib.format.open_memmap(
+            final_path,
+            mode="w+",
+            dtype=self.DTYPE,
+            shape=(filled, self.num_hidden_layers, self.num_experts),
+        )
+        for start in range(0, filled, self._COPY_CHUNK):
+            end = min(start + self._COPY_CHUNK, filled)
+            dst[start:end] = src[start:end]
+        dst.flush()
+        del dst, src
         os.unlink(temp_path)
         return final_path
 
@@ -706,10 +718,10 @@ def extract_routed_experts_for_current_batch(
     """
     capturer = get_global_experts_capturer()
     if capturer is None:
-        return None
+        return None, None
     host_cache = capturer.get_host_cache()
     if host_cache is None:
-        return None
+        return None, None
 
     finishing_req_ids: list[str] = []
     for req_id in req_ids:

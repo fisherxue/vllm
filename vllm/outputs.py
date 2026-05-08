@@ -153,6 +153,8 @@ class RequestOutput:
         self.kv_transfer_params = next_output.kv_transfer_params
         if next_output.prompt_routed_experts is not None:
             self.prompt_routed_experts = next_output.prompt_routed_experts
+        if next_output.router_logits_path is not None:
+            self.router_logits_path = next_output.router_logits_path
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
