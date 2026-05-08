@@ -1380,6 +1380,14 @@ class Scheduler(SchedulerInterface):
                 and req_id in model_runner_output.routed_experts_dict
             ):
                 routed_experts = model_runner_output.routed_experts_dict[req_id]
+            router_logits_path = None
+            if (
+                model_runner_output.router_logits_paths is not None
+                and req_id in model_runner_output.router_logits_paths
+            ):
+                router_logits_path = model_runner_output.router_logits_paths[
+                    req_id
+                ]
             finish_reason = None
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
@@ -1428,6 +1436,7 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
+                        router_logits_path=router_logits_path,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )

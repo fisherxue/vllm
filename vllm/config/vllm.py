@@ -1163,6 +1163,26 @@ class VllmConfig:
         ):
             self._validate_return_routed_experts()
 
+        if (
+            self.model_config is not None
+            and self.model_config.enable_return_router_logits
+        ):
+            if not self.model_config.enable_return_routed_experts:
+                raise ValueError(
+                    "enable_return_router_logits requires "
+                    "enable_return_routed_experts=True."
+                )
+            if not self.model_config.router_logits_output_dir:
+                raise ValueError(
+                    "enable_return_router_logits requires "
+                    "router_logits_output_dir to be set."
+                )
+            logger.warning(
+                "Router logits capture is a research feature intended "
+                "for offline / single-request workloads. High "
+                "concurrency may cause disk and page-cache pressure."
+            )
+
         # Re-compute compile ranges after platform-specific config updates
         # (e.g., XPU may lower max_num_batched_tokens when MLA is enabled)
         self._set_compile_ranges()

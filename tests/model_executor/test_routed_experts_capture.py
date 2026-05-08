@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
@@ -292,6 +293,99 @@ def test_monolithic_layers_raise_error(monkeypatch):
 
     with pytest.raises(NotImplementedError, match="monolithic"):
         rec_mod.bind_routing_capture_to_model(DummyModel())
+
+
+# =========================================================================
+# Tests for _RoutedExpertsDiskCache (router logits to disk)
+# =========================================================================
+
+
+class TestRoutedExpertsDiskCache:
+    def test_write_chunk_and_finalize(self, tmp_path):
+        """Write chunks at known positions and verify the final .npy file."""
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsDiskCache,
+        )
+
+        cache = _RoutedExpertsDiskCache(
+            output_dir=str(tmp_path),
+            num_hidden_layers=2,
+            num_experts=4,
+            max_model_len=16,
+        )
+        chunk = np.ones((3, 2, 4), dtype=np.float16) * 0.5
+        positions = np.array([0, 1, 2])
+        cache.write_chunk("req1", positions, chunk)
+
+        chunk2 = np.ones((2, 2, 4), dtype=np.float16) * 0.75
+        positions2 = np.array([3, 4])
+        cache.write_chunk("req1", positions2, chunk2)
+
+        path = cache.finalize("req1")
+        assert path is not None
+        assert path.endswith(".npy")
+
+        data = np.load(path)
+        assert data.shape == (5, 2, 4)
+        assert data.dtype == np.float16
+        assert np.allclose(data[:3], 0.5)
+        assert np.allclose(data[3:5], 0.75)
+
+    def test_free_request_deletes_files(self, tmp_path):
+        """Freeing a request should delete the temp mmap file."""
+        import os
+
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsDiskCache,
+        )
+
+        cache = _RoutedExpertsDiskCache(
+            output_dir=str(tmp_path),
+            num_hidden_layers=2,
+            num_experts=4,
+            max_model_len=16,
+        )
+        chunk = np.ones((2, 2, 4), dtype=np.float16)
+        cache.write_chunk("req1", np.array([0, 1]), chunk)
+
+        # Temp file should exist
+        assert len(os.listdir(tmp_path)) == 1
+
+        cache.free_request("req1")
+        assert len(os.listdir(tmp_path)) == 0
+
+    def test_finalize_nonexistent_returns_none(self, tmp_path):
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsDiskCache,
+        )
+
+        cache = _RoutedExpertsDiskCache(
+            output_dir=str(tmp_path),
+            num_hidden_layers=2,
+            num_experts=4,
+            max_model_len=16,
+        )
+        assert cache.finalize("nonexistent") is None
+
+    def test_counter_based_filenames(self, tmp_path):
+        """Filenames use internal counter, not raw request IDs."""
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsDiskCache,
+        )
+
+        cache = _RoutedExpertsDiskCache(
+            output_dir=str(tmp_path),
+            num_hidden_layers=1,
+            num_experts=2,
+            max_model_len=4,
+        )
+        chunk = np.ones((1, 1, 2), dtype=np.float16)
+        cache.write_chunk("../../etc/passwd", np.array([0]), chunk)
+        path = cache.finalize("../../etc/passwd")
+        assert path is not None
+        # Path should be inside tmp_path, not escaped
+        assert str(tmp_path) in path
+        assert "passwd" not in path
 
 
 # =========================================================================

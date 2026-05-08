@@ -4405,13 +4405,16 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_dict = None
+            router_logits_paths = None
             if self.routed_experts_initialized:
-                routed_experts_dict = extract_routed_experts_for_current_batch(
-                    req_ids=req_ids_output_copy,
-                    requests=self.requests,
-                    req_id_to_index=self.input_batch.req_id_to_index,
-                    num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
-                    max_model_len=self.max_model_len,
+                routed_experts_dict, router_logits_paths = (
+                    extract_routed_experts_for_current_batch(
+                        req_ids=req_ids_output_copy,
+                        requests=self.requests,
+                        req_id_to_index=self.input_batch.req_id_to_index,
+                        num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
+                        max_model_len=self.max_model_len,
+                    )
                 )
 
             output = ModelRunnerOutput(
@@ -4427,6 +4430,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts_dict=routed_experts_dict,
+                router_logits_paths=router_logits_paths,
             )
 
         if not self.use_async_scheduling:
@@ -6997,6 +7001,14 @@ class GPUModelRunner(
             num_fused_shared_experts = 0
 
         tp_group = get_tp_group()
+        num_experts = 0
+        router_logits_output_dir = None
+        if self.model_config.enable_return_router_logits:
+            num_experts = self.model_config.get_num_experts()
+            router_logits_output_dir = (
+                self.model_config.router_logits_output_dir
+            )
+
         init_routed_experts_capturer_with_shared_cache(
             enable=self.model_config.enable_return_routed_experts,
             model_config=self.model_config,
@@ -7006,6 +7018,8 @@ class GPUModelRunner(
             device=self.device,
             rank=tp_group.rank_in_group,
             world_size=tp_group.world_size,
+            num_experts=num_experts,
+            router_logits_output_dir=router_logits_output_dir,
         )
         self._bind_routed_experts_capturer()
         self.routed_experts_initialized = True
