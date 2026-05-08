@@ -43,6 +43,7 @@ def test_bind_routing_capture_to_model_sets_layer_view(monkeypatch):
     class DummyDeviceCache:
         def __init__(self, buf):
             self.buffer = buf
+            self.logits_buffer = None
 
     class DummyCapturer:
         def get_device_cache(self):
@@ -215,6 +216,7 @@ def test_capture_fn_writes_logical_ids_to_buffer(monkeypatch):
     class DummyDeviceCache:
         def __init__(self, buf):
             self.buffer = buf
+            self.logits_buffer = None
 
     class DummyCapturer:
         def get_device_cache(self):
@@ -274,6 +276,7 @@ def test_monolithic_layers_raise_error(monkeypatch):
     class DummyDeviceCache:
         def __init__(self, buf):
             self.buffer = buf
+            self.logits_buffer = None
 
     class DummyCapturer:
         def get_device_cache(self):

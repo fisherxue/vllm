@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -64,6 +65,7 @@ class _RoutedExpertsDeviceCache:
         num_hidden_layers: int,
         num_experts_per_tok: int,
         device: str,
+        num_experts: int = 0,
     ) -> None:
         # Layout: (L, N, K) so that buffer[layer_id] is a contiguous (N, K)
         # view — required by the FlashInfer routing-replay kernel which
@@ -74,10 +76,22 @@ class _RoutedExpertsDeviceCache:
             dtype=self.DTYPE,
             device=device,
         )
+        # Optional logits buffer: (L, N, E) float16 for full router logits.
+        if num_experts > 0:
+            self.logits_buffer: torch.Tensor | None = torch.zeros(
+                (num_hidden_layers, max_num_batched_tokens, num_experts),
+                dtype=torch.float16,
+                device=device,
+            )
+        else:
+            self.logits_buffer = None
         self._finalize_allocation_log()
 
     def get_buffer_size_bytes(self):
-        return self.buffer.nbytes
+        size = self.buffer.nbytes
+        if self.logits_buffer is not None:
+            size += self.logits_buffer.nbytes
+        return size
 
     def capture_fwd_routed_experts(self, layer_id: int, topk_ids: torch.Tensor):
         assert layer_id is not None, "capturing routing experts but get layer_id None"
@@ -172,6 +186,87 @@ class _RoutedExpertsHostCache:
         )
 
 
+class _RoutedExpertsDiskCache:
+    """Disk-backed cache for per-request router logits.
+
+    Uses pre-allocated memory-mapped numpy files for progressive writes.
+    On request completion, compacts to a final .npy file and deletes the
+    temp mmap.  Internal filenames are counter-based (not raw req_id) to
+    avoid path-injection from user-controlled request IDs.
+    """
+
+    DTYPE = np.float16
+
+    def __init__(
+        self,
+        output_dir: str,
+        num_hidden_layers: int,
+        num_experts: int,
+        max_model_len: int,
+    ) -> None:
+        self.output_dir = output_dir
+        self.num_hidden_layers = num_hidden_layers
+        self.num_experts = num_experts
+        self.max_model_len = max_model_len
+        os.makedirs(output_dir, exist_ok=True)
+
+        self._req_files: dict[str, str] = {}
+        self._req_mmaps: dict[str, np.memmap] = {}
+        self._filled_len: dict[str, int] = {}
+        self._file_counter = 0
+
+    def _make_temp_path(self) -> str:
+        self._file_counter += 1
+        return os.path.join(
+            self.output_dir, f"_tmp_{self._file_counter:08d}.logits.mmap"
+        )
+
+    def get_or_create_mmap(self, req_id: str) -> np.memmap:
+        if req_id not in self._req_mmaps:
+            path = self._make_temp_path()
+            mmap = np.lib.format.open_memmap(
+                path,
+                mode="w+",
+                dtype=self.DTYPE,
+                shape=(self.max_model_len, self.num_hidden_layers, self.num_experts),
+            )
+            self._req_files[req_id] = path
+            self._req_mmaps[req_id] = mmap
+        return self._req_mmaps[req_id]
+
+    def write_chunk(
+        self, req_id: str, positions: np.ndarray, logits_chunk: np.ndarray
+    ) -> None:
+        mmap = self.get_or_create_mmap(req_id)
+        mmap[positions] = logits_chunk
+        max_pos = int(positions.max()) + 1
+        self._filled_len[req_id] = max(self._filled_len.get(req_id, 0), max_pos)
+
+    def finalize(self, req_id: str) -> str | None:
+        """Write compact final .npy and delete temp file."""
+        if req_id not in self._req_mmaps:
+            return None
+        mmap = self._req_mmaps.pop(req_id)
+        filled = self._filled_len.pop(req_id, 0)
+        temp_path = self._req_files.pop(req_id)
+        data = np.array(mmap[:filled])
+        del mmap
+        final_path = temp_path.replace("_tmp_", "").replace(".mmap", ".npy")
+        np.save(final_path, data)
+        os.unlink(temp_path)
+        return final_path
+
+    def free_request(self, req_id: str) -> None:
+        """Discard without saving (preemption)."""
+        mmap = self._req_mmaps.pop(req_id, None)
+        temp_path = self._req_files.pop(req_id, None)
+        self._filled_len.pop(req_id, None)
+        if mmap is not None:
+            del mmap
+        if temp_path is not None and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
 class RoutedExpertsCapturer(ABC):
     @staticmethod
     def create(
@@ -183,6 +278,8 @@ class RoutedExpertsCapturer(ABC):
         device: str,
         shared_host_cache: _RoutedExpertsHostCache | None = None,
         skip_host_cache: bool = False,
+        num_experts: int = 0,
+        router_logits_output_dir: str | None = None,
     ):
         if enable:
             return _RoutedExpertsCapturerReal(
@@ -193,6 +290,8 @@ class RoutedExpertsCapturer(ABC):
                 device=device,
                 shared_host_cache=shared_host_cache,
                 skip_host_cache=skip_host_cache,
+                num_experts=num_experts,
+                router_logits_output_dir=router_logits_output_dir,
             )
         return _RoutedExpertsCapturerNoop()
 
@@ -266,6 +365,8 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         device: str,
         shared_host_cache: _RoutedExpertsHostCache | None = None,
         skip_host_cache: bool = False,
+        num_experts: int = 0,
+        router_logits_output_dir: str | None = None,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
         self.num_hidden_layers = _count_moe_layers(model_config.hf_text_config)
@@ -273,6 +374,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
         self._skip_host_cache = skip_host_cache
+        self._enable_logits = num_experts > 0 and router_logits_output_dir is not None
 
         if skip_host_cache:
             self.host_cache = None
@@ -291,7 +393,22 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             num_hidden_layers=self.num_hidden_layers,
             num_experts_per_tok=self.num_experts_per_tok,
             device=device,
+            num_experts=num_experts if self._enable_logits else 0,
         )
+
+        # ---- Disk cache for logits (rank-0 only) ----
+        if self._enable_logits and not skip_host_cache:
+            assert router_logits_output_dir is not None
+            self.disk_cache: _RoutedExpertsDiskCache | None = (
+                _RoutedExpertsDiskCache(
+                    output_dir=router_logits_output_dir,
+                    num_hidden_layers=self.num_hidden_layers,
+                    num_experts=num_experts,
+                    max_model_len=self.max_model_len,
+                )
+            )
+        else:
+            self.disk_cache = None
 
         # ---- Async D2H pipeline (rank-0 only) ----
         # Non-rank-0 workers only need the device buffer for symmetric
@@ -319,18 +436,34 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             self._copy_stream = torch.cuda.Stream(device=device)
             self._copy_event = torch.cuda.Event()
 
+            # Logits staging buffers (only when logits capture is enabled).
+            if self._enable_logits and self.device_cache.logits_buffer is not None:
+                self._pinned_logits_staging: torch.Tensor | None = torch.zeros_like(
+                    self.device_cache.logits_buffer, pin_memory=True
+                )
+                self._device_logits_staging: torch.Tensor | None = (
+                    torch.empty_like(self.device_cache.logits_buffer)
+                )
+            else:
+                self._pinned_logits_staging = None
+                self._device_logits_staging = None
+
             pinned_mb = self._pinned_staging.nbytes / _MB
+            if self._pinned_logits_staging is not None:
+                pinned_mb += self._pinned_logits_staging.nbytes / _MB
             logger.info(
                 "Routing experts pinned staging buffer allocated. "
-                "shape=%s, size=%.2f MB",
-                tuple(self._pinned_staging.shape),
+                "size=%.2f MB (logits=%s)",
                 pinned_mb,
+                self._enable_logits,
             )
         else:
             self._pinned_staging = None
             self._device_staging = None
             self._copy_stream = None
             self._copy_event = None
+            self._pinned_logits_staging = None
+            self._device_logits_staging = None
             logger.info(
                 "Routing experts device-only capturer (rank != 0). "
                 "Device buffer shape=%s",
@@ -373,11 +506,29 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self._device_staging[:, :total_tokens, :].copy_(
             self.device_cache.buffer[:, :total_tokens, :], non_blocking=True
         )
+        # Snapshot logits device buffer on main stream (if enabled).
+        if (
+            self._device_logits_staging is not None
+            and self.device_cache.logits_buffer is not None
+        ):
+            self._device_logits_staging[:, :total_tokens, :].copy_(
+                self.device_cache.logits_buffer[:, :total_tokens, :],
+                non_blocking=True,
+            )
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_stream(main_stream)
             self._pinned_staging[:, :total_tokens, :].copy_(
                 self._device_staging[:, :total_tokens, :], non_blocking=True
             )
+            # D2H logits on same stream (if enabled).
+            if (
+                self._pinned_logits_staging is not None
+                and self._device_logits_staging is not None
+            ):
+                self._pinned_logits_staging[:, :total_tokens, :].copy_(
+                    self._device_logits_staging[:, :total_tokens, :],
+                    non_blocking=True,
+                )
             self._copy_event.record()
 
         # 3. Save metadata for deferred scatter.
@@ -409,6 +560,15 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         assert positions_np is not None
         assert host_cache is not None
 
+        # Transpose logits (L, N, E) -> (N, L, E) if enabled.
+        logits_values = None
+        if self._pinned_logits_staging is not None and self.disk_cache is not None:
+            logits_values = (
+                self._pinned_logits_staging[:, : self._pending_total_tokens, :]
+                .numpy()
+                .transpose(1, 0, 2)
+            )
+
         offset = 0
         for req_id, n_tokens in self._pending_num_scheduled.items():
             if n_tokens == 0:
@@ -427,6 +587,16 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 buf = host_cache.get_or_grow_buffer(req_id, max_pos)
                 buf[pos] = host_values[offset : offset + n_tokens]
                 host_cache.update_filled_len(req_id, max_pos)
+
+            # Scatter logits to disk (same position mapping).
+            if logits_values is not None and self.disk_cache is not None:
+                if n_tokens == 1:
+                    pos_arr = positions_np[offset : offset + 1]
+                else:
+                    pos_arr = pos  # type: ignore[possibly-undefined]
+                self.disk_cache.write_chunk(
+                    req_id, pos_arr, logits_values[offset : offset + n_tokens]
+                )
 
             offset += n_tokens
 
@@ -582,13 +752,14 @@ def extract_routed_experts_for_current_batch(
             finishing_req_ids.append(req_id)
 
     if not finishing_req_ids:
-        return None
+        return None, None
 
     # At least one request is finishing: ensure the latest async D2H
     # copy has been scattered into the host cache.
     capturer.finalize_pending_copy()
 
     result: dict[str, np.ndarray] = {}
+    logits_paths: dict[str, str] = {}
     for req_id in finishing_req_ids:
         seqlen = host_cache.get_filled_len(req_id)
         if seqlen <= 0:
@@ -596,8 +767,17 @@ def extract_routed_experts_for_current_batch(
         experts = capturer.get_routed_experts(req_id, seqlen=seqlen, free_slot=False)
         if experts is not None:
             result[req_id] = experts
+        # Finalize logits to disk if disk cache is active.
+        disk_cache = getattr(capturer, "disk_cache", None)
+        if disk_cache is not None:
+            path = disk_cache.finalize(req_id)
+            if path is not None:
+                logits_paths[req_id] = path
 
-    return result if result else None
+    return (
+        result if result else None,
+        logits_paths if logits_paths else None,
+    )
 
 
 def free_routing_buffers(
@@ -626,11 +806,17 @@ def free_routing_buffers(
     if host_cache is None:
         return
 
+    disk_cache = getattr(capturer, "disk_cache", None)
+
     for req_id in finished_req_ids:
         host_cache.free_request(req_id)
+        if disk_cache is not None:
+            disk_cache.free_request(req_id)
     if preempted_req_ids:
         for req_id in preempted_req_ids:
             host_cache.free_request(req_id)
+            if disk_cache is not None:
+                disk_cache.free_request(req_id)
 
 
 def issue_routing_d2h_copy(
@@ -730,6 +916,8 @@ def init_routed_experts_capturer_with_shared_cache(
     device: str,
     rank: int = 0,
     world_size: int = 1,
+    num_experts: int = 0,
+    router_logits_output_dir: str | None = None,
 ) -> RoutedExpertsCapturer:
     """Initialize capturer with rank-aware handling (only rank 0 captures)."""
     if not enable:
@@ -751,6 +939,7 @@ def init_routed_experts_capturer_with_shared_cache(
             max_model_len=max_model_len,
             device=device,
             skip_host_cache=True,
+            num_experts=num_experts,
         )
         set_global_experts_capturer(capturer)
         return capturer
@@ -763,6 +952,8 @@ def init_routed_experts_capturer_with_shared_cache(
         max_model_len=max_model_len,
         device=device,
         skip_host_cache=False,
+        num_experts=num_experts,
+        router_logits_output_dir=router_logits_output_dir,
     )
     set_global_experts_capturer(capturer)
     return capturer
@@ -851,6 +1042,29 @@ def bind_routing_capture_to_model(model) -> None:
                     buf[: topk_ids.shape[0]].copy_(topk_ids.to(buf.dtype))
 
                 module.router.set_capture_fn(_capture_logical_ids)
+
+            # Wire logits capture (if logits buffer is allocated).
+            logits_buffer = device_cache.logits_buffer
+            if (
+                logits_buffer is not None
+                and hasattr(module, "router")
+            ):
+                logits_layer_buf = logits_buffer[layer_id]
+                if hasattr(torch.compiler, "cudagraph_mark_tensor_static"):
+                    torch.compiler.cudagraph_mark_tensor_static(logits_layer_buf)
+                with contextlib.suppress(Exception):
+                    torch._dynamo.mark_static_address(logits_layer_buf)
+
+                _lbuf = logits_layer_buf
+
+                def _capture_logits(
+                    router_logits: torch.Tensor, buf: torch.Tensor = _lbuf
+                ) -> None:
+                    buf[: router_logits.shape[0]].copy_(
+                        router_logits.to(buf.dtype)
+                    )
+
+                module.router.set_logits_capture_fn(_capture_logits)
 
             bound += 1
 

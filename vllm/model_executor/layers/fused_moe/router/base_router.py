@@ -167,10 +167,17 @@ class BaseRouter(FusedMoERouter):
         self.enable_eplb = enable_eplb
         self.indices_type_getter = indices_type_getter
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self._logits_capture_fn: Callable[[torch.Tensor], None] | None = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
         self.capture_fn = capture_fn
+
+    def set_logits_capture_fn(
+        self, logits_capture_fn: Callable[[torch.Tensor], None] | None
+    ) -> None:
+        """Set a capture callback for full router logits (all experts)."""
+        self._logits_capture_fn = logits_capture_fn
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
@@ -276,6 +283,10 @@ class BaseRouter(FusedMoERouter):
         """
         # Step 1: Validate EPLB state
         self._validate_eplb_state()
+
+        # Capture full router logits before top-k / softmax.
+        if self._logits_capture_fn is not None:
+            self._logits_capture_fn(router_logits)
 
         # Step 2: Get indices type.
         indices_type = self._get_indices_type()
