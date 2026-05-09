@@ -450,8 +450,10 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
             # Logits staging buffers (only when logits capture is enabled).
             if self._enable_logits and self.device_cache.logits_buffer is not None:
-                self._pinned_logits_staging: torch.Tensor | None = torch.zeros_like(
-                    self.device_cache.logits_buffer, pin_memory=True
+                logits_shape = self.device_cache.logits_buffer.shape
+                logits_dtype = self.device_cache.logits_buffer.dtype
+                self._pinned_logits_staging: torch.Tensor | None = torch.zeros(
+                    logits_shape, dtype=logits_dtype, pin_memory=True,
                 )
                 self._device_logits_staging: torch.Tensor | None = (
                     torch.empty_like(self.device_cache.logits_buffer)
