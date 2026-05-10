@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import abstractmethod
 from collections.abc import Callable
+import json
+import os
 
+import numpy as np
 import torch
 
 from vllm.distributed.eplb.eplb_state import EplbLayerState
@@ -135,6 +138,77 @@ else:
         return topk_ids
 
 
+_override_config_cache: dict[str, dict] = {}
+_override_layer_counter: int = 0
+
+
+def _build_override_for_layer(cfg_path: str, layer_id: int) -> Callable:
+    """Build a per-layer override function from a JSON config file."""
+    if cfg_path not in _override_config_cache:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        hot_mask = np.load(cfg["hot_mask_path"])
+        _override_config_cache[cfg_path] = {
+            "hot_tensor": torch.from_numpy(hot_mask).bool(),
+            "per_layer": hot_mask.ndim == 2,
+            "start_slot": 1 if cfg.get("policy", "two_tier") == "two_tier" else 0,
+            "normalize": cfg.get("normalize", "softmax"),
+        }
+
+    c = _override_config_cache[cfg_path]
+    hot_tensor = c["hot_tensor"]
+    per_layer = c["per_layer"]
+    start_slot = c["start_slot"]
+
+    if per_layer:
+        lid = min(layer_id, hot_tensor.shape[0] - 1)
+        layer_mask = hot_tensor[lid]
+    else:
+        layer_mask = hot_tensor
+
+    if c["normalize"] == "softmax":
+        norm_fn = lambda x: torch.softmax(x, dim=-1)
+    elif c["normalize"] == "sigmoid":
+        norm_fn = torch.sigmoid
+    else:
+        raise ValueError(f"Unknown normalize={c['normalize']!r}")
+
+    _gpu_mask: dict[str, torch.Tensor] = {}
+
+    def override_fn(topk_weights, topk_ids, router_logits):
+        dev_key = str(topk_ids.device)
+        if dev_key not in _gpu_mask:
+            _gpu_mask[dev_key] = layer_mask.to(topk_ids.device)
+        hot = _gpu_mask[dev_key]
+
+        T, K = topk_ids.shape
+        new_ids = topk_ids.clone()
+        new_weights = topk_weights.clone()
+        scores = norm_fn(router_logits)
+        arange_T = torch.arange(T, device=topk_ids.device)
+
+        for slot in range(start_slot, K):
+            expert_id = new_ids[:, slot]
+            is_miss = ~hot[expert_id]
+            if not is_miss.any():
+                continue
+            candidate = scores.clone()
+            candidate[:, ~hot] = -1.0
+            for s in range(K):
+                if s == slot:
+                    continue
+                candidate[arange_T, new_ids[:, s]] = -1.0
+            best = candidate.argmax(dim=1)
+            best_w = scores[arange_T, best]
+            new_ids[:, slot] = torch.where(is_miss, best, new_ids[:, slot])
+            new_weights[:, slot] = torch.where(
+                is_miss, best_w, new_weights[:, slot]
+            )
+        return new_weights, new_ids
+
+    return override_fn
+
+
 class BaseRouter(FusedMoERouter):
     """
     Base router class that provides common functionality for all router implementations.
@@ -172,6 +246,7 @@ class BaseRouter(FusedMoERouter):
             [torch.Tensor, torch.Tensor, torch.Tensor],
             tuple[torch.Tensor, torch.Tensor],
         ] | None = None
+        self._override_checked = False
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
@@ -322,6 +397,21 @@ class BaseRouter(FusedMoERouter):
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
+
+        # Lazy-load override from env var on first call (TP-safe:
+        # every worker's router does this independently).
+        # Layer ID is assigned via a monotonic counter — routers are
+        # called in layer order during the first forward pass.
+        if not self._override_checked:
+            self._override_checked = True
+            cfg_path = os.environ.get("MOE_ROUTING_OVERRIDE")
+            if cfg_path and os.path.isfile(cfg_path):
+                global _override_layer_counter
+                layer_id = _override_layer_counter
+                _override_layer_counter += 1
+                self._override_fn = _build_override_for_layer(
+                    cfg_path, layer_id
+                )
 
         # Override routing decisions (original already captured above).
         if self._override_fn is not None:
