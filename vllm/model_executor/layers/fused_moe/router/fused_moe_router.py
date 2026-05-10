@@ -28,6 +28,17 @@ class FusedMoERouter(ABC):
     ) -> None:
         raise NotImplementedError
 
+    @abstractmethod
+    def set_override_fn(
+        self,
+        override_fn: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor],
+        ]
+        | None,
+    ) -> None:
+        raise NotImplementedError
+
     @property
     @abstractmethod
     def routing_method_type(self) -> RoutingMethodType:

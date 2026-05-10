@@ -6,6 +6,7 @@ import contextlib
 import logging
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -382,7 +383,18 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
         self.num_hidden_layers = _count_moe_layers(model_config.hf_text_config)
-        self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
+        hf_cfg = model_config.hf_text_config
+        for _attr in ("num_experts_per_tok", "top_k_experts", "moe_topk",
+                       "num_experts_per_token"):
+            _val = getattr(hf_cfg, _attr, None)
+            if _val is not None and _val > 0:
+                self.num_experts_per_tok = _val
+                break
+        else:
+            raise ValueError(
+                "Could not determine num_experts_per_tok from model config. "
+                f"Checked attributes on {type(hf_cfg).__name__}."
+            )
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
         self._skip_host_cache = skip_host_cache
@@ -1087,3 +1099,134 @@ def bind_routing_capture_to_model(model) -> None:
         bound,
         tuple(buffer.shape),
     )
+
+    _maybe_bind_override_from_env(model)
+
+
+# ---------------------------------------------------------------------------
+# Routing override: env-var-based config for TP-safe initialization
+# ---------------------------------------------------------------------------
+
+_ROUTING_OVERRIDE_ENV = "MOE_ROUTING_OVERRIDE"
+
+
+def _maybe_bind_override_from_env(model) -> None:
+    """Load routing override config from env var and bind to model.
+
+    Called from bind_routing_capture_to_model() which runs in EVERY
+    worker process BEFORE CUDA graph capture, so this is both TP-safe
+    and graph-safe.
+    """
+    config_path = os.environ.get(_ROUTING_OVERRIDE_ENV)
+    if not config_path:
+        return
+
+    import json
+
+    if not os.path.isfile(config_path):
+        logger.warning(
+            "%s=%s but file does not exist, skipping override",
+            _ROUTING_OVERRIDE_ENV, config_path,
+        )
+        return
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    hot_mask_path = cfg["hot_mask_path"]
+    hot_mask = np.load(hot_mask_path)
+    policy = cfg.get("policy", "two_tier")
+    normalize = cfg.get("normalize", "softmax")
+
+    import torch as _torch
+
+    hot_tensor = _torch.from_numpy(hot_mask).bool()
+    per_layer = hot_tensor.ndim == 2
+
+    if normalize == "softmax":
+        norm_fn = lambda x: _torch.softmax(x, dim=-1)
+    elif normalize == "sigmoid":
+        norm_fn = _torch.sigmoid
+    else:
+        raise ValueError(f"Unknown normalize={normalize!r} in {config_path}")
+
+    keep_top1 = policy == "two_tier"
+    start_slot = 1 if keep_top1 else 0
+    _gpu_cache: dict[int, _torch.Tensor] = {}
+
+    def override_fn(topk_weights, topk_ids, router_logits, layer_idx):
+        if layer_idx not in _gpu_cache:
+            src = hot_tensor[layer_idx] if per_layer else hot_tensor
+            _gpu_cache[layer_idx] = src.to(topk_ids.device)
+        hot = _gpu_cache[layer_idx]
+
+        T, K = topk_ids.shape
+        new_ids = topk_ids.clone()
+        new_weights = topk_weights.clone()
+        scores = norm_fn(router_logits)
+        arange_T = _torch.arange(T, device=topk_ids.device)
+
+        for slot in range(start_slot, K):
+            expert_id = new_ids[:, slot]
+            is_miss = ~hot[expert_id]
+            if not is_miss.any():
+                continue
+            candidate = scores.clone()
+            candidate[:, ~hot] = -1.0
+            for s in range(K):
+                if s == slot:
+                    continue
+                candidate[arange_T, new_ids[:, s]] = -1.0
+            best = candidate.argmax(dim=1)
+            best_w = scores[arange_T, best]
+            new_ids[:, slot] = _torch.where(is_miss, best, new_ids[:, slot])
+            new_weights[:, slot] = _torch.where(
+                is_miss, best_w, new_weights[:, slot]
+            )
+
+        return new_weights, new_ids
+
+    n = bind_routing_override_to_model(model, override_fn)
+    logger.info(
+        "Loaded routing override from %s: policy=%s, normalize=%s, "
+        "hot_mask shape=%s, bound to %s layers",
+        config_path, policy, normalize, hot_mask.shape, n,
+    )
+
+
+def bind_routing_override_to_model(
+    model,
+    override_fn: Callable,
+) -> int:
+    """Bind a routing override function to all FusedMoE layers.
+
+    override_fn(topk_weights, topk_ids, router_logits, layer_idx)
+        -> (new_topk_weights, new_topk_ids)
+
+    The per-router hook receives (topk_weights, topk_ids, router_logits)
+    without layer_idx; this function wraps the user's 4-arg function into
+    per-layer 3-arg closures that bake in the layer index.
+
+    Returns the number of layers bound.
+    """
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+    bound = 0
+    for module in model.modules():
+        if not isinstance(module, FusedMoE) or not hasattr(module, "moe_layer_id"):
+            continue
+        if not hasattr(module, "router"):
+            continue
+
+        layer_id = module.moe_layer_id
+
+        def _make_override(lid: int):
+            def _override(topk_weights, topk_ids, router_logits):
+                return override_fn(topk_weights, topk_ids, router_logits, lid)
+            return _override
+
+        module.router.set_override_fn(_make_override(layer_id))
+        bound += 1
+
+    logger.info("Bound routing override to %s FusedMoE layers.", bound)
+    return bound

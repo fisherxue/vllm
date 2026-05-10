@@ -168,6 +168,10 @@ class BaseRouter(FusedMoERouter):
         self.indices_type_getter = indices_type_getter
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
         self._logits_capture_fn: Callable[[torch.Tensor], None] | None = None
+        self._override_fn: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor],
+        ] | None = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
@@ -178,6 +182,25 @@ class BaseRouter(FusedMoERouter):
     ) -> None:
         """Set a capture callback for full router logits (all experts)."""
         self._logits_capture_fn = logits_capture_fn
+
+    def set_override_fn(
+        self,
+        override_fn: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor],
+        ]
+        | None,
+    ) -> None:
+        """Set a routing override function.
+
+        override_fn(topk_weights, topk_ids, router_logits)
+            -> (new_topk_weights, new_topk_ids)
+
+        Called after capture (original routing is logged) but before
+        EPLB mapping, so the model executes with modified routing while
+        the capture buffer retains the original decisions.
+        """
+        self._override_fn = override_fn
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
@@ -299,6 +322,26 @@ class BaseRouter(FusedMoERouter):
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
+
+        # Override routing decisions (original already captured above).
+        if self._override_fn is not None:
+            orig_shape = topk_ids.shape
+            orig_device = topk_ids.device
+            topk_weights, topk_ids = self._override_fn(
+                topk_weights, topk_ids, router_logits
+            )
+            assert topk_ids.shape == orig_shape, (
+                f"override changed topk_ids shape: {orig_shape} -> {topk_ids.shape}"
+            )
+            assert topk_weights.shape == orig_shape, (
+                f"override changed topk_weights shape: {orig_shape} -> {topk_weights.shape}"
+            )
+            assert topk_ids.device == orig_device, (
+                f"override moved topk_ids to {topk_ids.device}, expected {orig_device}"
+            )
+            assert (topk_ids >= 0).all() and (topk_ids < self.global_num_experts).all(), (
+                "override produced out-of-range expert IDs"
+            )
 
         # Step 4: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)
