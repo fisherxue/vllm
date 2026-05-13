@@ -140,22 +140,94 @@ else:
 
 _override_config_cache: dict[str, dict] = {}
 _override_layer_counter: int = 0
+_capture_buffers: dict[int, dict] = {}
+_capture_output_dir: str | None = None
+_capture_flush_interval: int = 1024
+_capture_rank: int | None = None
+_capture_flush_counter: int = 0
+
+
+def _flush_capture_buffers() -> None:
+    """Write accumulated capture buffers to disk.
+
+    Uses a per-process flush counter in the filename to avoid races
+    between TP workers. Only rank-0 data is used downstream.
+    """
+    global _capture_flush_counter
+    if not _capture_output_dir or not _capture_buffers:
+        return
+    os.makedirs(_capture_output_dir, exist_ok=True)
+    pid = os.getpid()
+    for lid, data in _capture_buffers.items():
+        if not data["ids"]:
+            continue
+        ids = np.concatenate(data["ids"], axis=0)
+        logits = np.concatenate(data["logits"], axis=0)
+        np.save(os.path.join(
+            _capture_output_dir,
+            f"layer_{lid:03d}_ids_p{pid}_{_capture_flush_counter:04d}.npy"
+        ), ids)
+        np.save(os.path.join(
+            _capture_output_dir,
+            f"layer_{lid:03d}_logits_p{pid}_{_capture_flush_counter:04d}.npy"
+        ), logits)
+        data["ids"].clear()
+        data["logits"].clear()
+    _capture_flush_counter += 1
+
+
+import atexit
+atexit.register(_flush_capture_buffers)
 
 
 def _build_override_for_layer(cfg_path: str, layer_id: int) -> Callable:
-    """Build a per-layer override function from a JSON config file."""
+    """Build a per-layer override function from a JSON config file.
+
+    Supports policies:
+    - "capture": pass-through, saves expert IDs + logits to disk
+    - "two_tier": keep top-1, substitute from hot set
+    - "prune": substitute all slots from hot set
+    """
+    global _capture_output_dir
+
     if cfg_path not in _override_config_cache:
         with open(cfg_path) as f:
             cfg = json.load(f)
-        hot_mask = np.load(cfg["hot_mask_path"])
-        _override_config_cache[cfg_path] = {
-            "hot_tensor": torch.from_numpy(hot_mask).bool(),
-            "per_layer": hot_mask.ndim == 2,
-            "start_slot": 1 if cfg.get("policy", "two_tier") == "two_tier" else 0,
-            "normalize": cfg.get("normalize", "softmax"),
-        }
+        policy = cfg.get("policy", "two_tier")
+        _override_config_cache[cfg_path] = {"policy": policy, "cfg": cfg}
+
+        if policy == "capture":
+            _capture_output_dir = cfg.get("output_dir", "/tmp/moe_capture")
+            os.makedirs(_capture_output_dir, exist_ok=True)
+
+        if policy != "capture":
+            hot_mask = np.load(cfg["hot_mask_path"])
+            _override_config_cache[cfg_path].update({
+                "hot_tensor": torch.from_numpy(hot_mask).bool(),
+                "per_layer": hot_mask.ndim == 2,
+                "start_slot": 1 if policy == "two_tier" else 0,
+                "normalize": cfg.get("normalize", "softmax"),
+            })
 
     c = _override_config_cache[cfg_path]
+    policy = c["policy"]
+
+    # ── Capture-only mode: save data, return unchanged ──
+    if policy == "capture":
+        _lid = layer_id
+        _capture_buffers[_lid] = {"ids": [], "logits": []}
+
+        def capture_fn(topk_weights, topk_ids, router_logits):
+            buf = _capture_buffers[_lid]
+            buf["ids"].append(topk_ids.cpu().to(torch.int16).numpy())
+            buf["logits"].append(router_logits.cpu().to(torch.float16).numpy())
+            if sum(len(b["ids"]) for b in _capture_buffers.values()) >= _capture_flush_interval:
+                _flush_capture_buffers()
+            return topk_weights, topk_ids
+
+        return capture_fn
+
+    # ── Override modes: two_tier / prune ──
     hot_tensor = c["hot_tensor"]
     per_layer = c["per_layer"]
     start_slot = c["start_slot"]
