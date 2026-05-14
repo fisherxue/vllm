@@ -142,18 +142,18 @@ _override_config_cache: dict[str, dict] = {}
 _override_layer_counter: int = 0
 _capture_buffers: dict[int, dict] = {}
 _capture_output_dir: str | None = None
-_capture_flush_interval: int = 1024
-_capture_rank: int | None = None
-_capture_flush_counter: int = 0
+_capture_flush_interval: int = 4096
 
 
 def _flush_capture_buffers() -> None:
-    """Write accumulated capture buffers to disk.
+    """Append accumulated capture buffers to per-layer binary files.
 
-    Uses a per-process flush counter in the filename to avoid races
-    between TP workers. Only rank-0 data is used downstream.
+    Each worker appends to two files per layer:
+      {output_dir}/L{lid:03d}_ids_w{pid}.bin   — int16, width K
+      {output_dir}/L{lid:03d}_logits_w{pid}.bin — float16, width E
+
+    This produces O(layers × workers) files instead of O(tokens × layers).
     """
-    global _capture_flush_counter
     if not _capture_output_dir or not _capture_buffers:
         return
     os.makedirs(_capture_output_dir, exist_ok=True)
@@ -163,17 +163,16 @@ def _flush_capture_buffers() -> None:
             continue
         ids = np.concatenate(data["ids"], axis=0)
         logits = np.concatenate(data["logits"], axis=0)
-        np.save(os.path.join(
-            _capture_output_dir,
-            f"layer_{lid:03d}_ids_p{pid}_{_capture_flush_counter:04d}.npy"
-        ), ids)
-        np.save(os.path.join(
-            _capture_output_dir,
-            f"layer_{lid:03d}_logits_p{pid}_{_capture_flush_counter:04d}.npy"
-        ), logits)
+        with open(os.path.join(
+            _capture_output_dir, f"L{lid:03d}_ids_w{pid}.bin"
+        ), "ab") as f:
+            f.write(ids.tobytes())
+        with open(os.path.join(
+            _capture_output_dir, f"L{lid:03d}_logits_w{pid}.bin"
+        ), "ab") as f:
+            f.write(logits.tobytes())
         data["ids"].clear()
         data["logits"].clear()
-    _capture_flush_counter += 1
 
 
 import atexit
