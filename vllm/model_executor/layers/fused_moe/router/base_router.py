@@ -142,7 +142,7 @@ _override_config_cache: dict[str, dict] = {}
 _override_layer_counter: int = 0
 _capture_buffers: dict[int, dict] = {}
 _capture_output_dir: str | None = None
-_capture_flush_interval: int = 4096
+_capture_flush_interval: int = 1
 
 
 def _flush_capture_buffers() -> None:
